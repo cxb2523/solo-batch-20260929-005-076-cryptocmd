@@ -7,17 +7,85 @@ import json
 import os
 import sys
 import datetime
+import re
+from functools import lru_cache
 from requests import get
 
 
 _CMC_DATA_API = "https://api.coinmarketcap.com/data-api/v3"
 
-with open(os.path.join(os.path.dirname(__file__), "fiat_ids.json")) as _f:
-    _FIAT_IDS = json.load(_f)
+_FIAT_IDS_PATH = os.path.join(os.path.dirname(__file__), "fiat_ids.json")
 
-_SUPPORTED_FIATS = ", ".join(sorted(_FIAT_IDS))
+_FIAT_CODE_PATTERN = re.compile(r"^[A-Z]{3}$")
 
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+@lru_cache(maxsize=None)
+def normalize(value):
+    """
+    Normalize a coin or fiat identifier for comparison: strips leading and
+    trailing whitespace, lowercases, and treats hyphens and underscores as
+    equivalent separators.
+    :param value: raw identifier (code, name, or slug); ``None`` normalizes to ""
+    :return: normalized key string
+    """
+
+    if value is None:
+        return ""
+    return str(value).strip().lower().replace("-", "_")
+
+
+def _load_fiat_ids():
+    with open(_FIAT_IDS_PATH) as f:
+        return json.load(f)
+
+
+def _build_fiat_indexes(fiat_ids):
+    code_ids, name_ids = {}, {}
+    for key, value in fiat_ids.items():
+        if _FIAT_CODE_PATTERN.match(key):
+            code_ids[normalize(key)] = value
+        else:
+            name_ids[normalize(key)] = value
+    return code_ids, name_ids
+
+
+_FIAT_IDS = _load_fiat_ids()
+_FIAT_CODE_IDS, _FIAT_NAME_IDS = _build_fiat_indexes(_FIAT_IDS)
+
+_SUPPORTED_FIATS = ", ".join(sorted(k.upper() for k in _FIAT_CODE_IDS))
+
+# Cache of normalized resolution results keyed by (scope, normalized key).
+# Invalidated whenever the fiat table is hot-reloaded.
+_RESOLVE_CACHE = {}
+
+
+def reload_fiat_ids():
+    """
+    Hot-reload the fiat table from disk and invalidate cached resolutions.
+    """
+
+    global _FIAT_IDS, _FIAT_CODE_IDS, _FIAT_NAME_IDS, _SUPPORTED_FIATS
+    _FIAT_IDS = _load_fiat_ids()
+    _FIAT_CODE_IDS, _FIAT_NAME_IDS = _build_fiat_indexes(_FIAT_IDS)
+    _SUPPORTED_FIATS = ", ".join(sorted(k.upper() for k in _FIAT_CODE_IDS))
+    _RESOLVE_CACHE.clear()
+
+
+def resolve_fiat_id(fiat):
+    """
+    Resolve a fiat code or name to its numeric CoinMarketCap convert id.
+    Codes take priority over names; lookups are normalized and cached.
+    :param fiat: fiat code (e.g. USD) or fiat name (e.g. US Dollar)
+    :return: numeric convert id, or None when the fiat is unknown
+    """
+
+    key = normalize(fiat)
+    token = ("fiat", key)
+    if token not in _RESOLVE_CACHE:
+        _RESOLVE_CACHE[token] = _FIAT_CODE_IDS.get(key, _FIAT_NAME_IDS.get(key))
+    return _RESOLVE_CACHE[token]
 
 
 def get_url_data(url):
@@ -35,12 +103,11 @@ def get_url_data(url):
         raise e
 
 
-def get_coin_id(coin_code, coin_name):
+def get_coin_list():
     """
-    This method fetches the id of currency from the given code
-    :param coin_code: coin code of a cryptocurrency e.g. btc
-    :param coin_name: coin name in case of many coins with same code e.g. sol -> solana, solcoin
-    :return: numeric coin id for the cryptocurrency on coinmarketcap.com
+    Fetch the full cryptocurrency listing from coinmarketcap.com.
+    :return: list of coin dicts as returned by the CMC data API
+        (id, name, symbol, slug, cmcRank, ...)
     """
 
     api_url = (
@@ -49,27 +116,97 @@ def get_coin_id(coin_code, coin_name):
         "&cryptoType=all&tagType=all&audited=false"
     ).format(_CMC_DATA_API)
 
+    json_data = get_url_data(api_url).json()
+    error_code = json_data["status"]["error_code"]
+    if str(error_code) == "0":
+        return json_data["data"]["cryptoCurrencyList"]
+    if str(error_code) == "400":
+        raise InvalidCoinCode("coin listing is unavailable on coinmarketcap.com")
+    raise Exception(json_data["status"]["error_message"])
+
+
+def _coin_rank(coin):
+    rank = coin.get("cmcRank")
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        return float("inf")
+    return rank
+
+
+def _coin_sort_key(coin):
+    return _coin_rank(coin), coin.get("id", float("inf"))
+
+
+def build_coin_index(coins):
+    """
+    Build an index mapping normalized symbol/slug keys to matching coins.
+    :param coins: list of coin dicts as returned by :func:`get_coin_list`
+    :return: dict of normalized key -> list of coin dicts
+    """
+
+    index = {}
+    for coin in coins:
+        for raw in (coin.get("symbol"), coin.get("slug")):
+            key = normalize(raw)
+            if key:
+                index.setdefault(key, []).append(coin)
+    return index
+
+
+def resolve_coin_id(coin_code, coin_name=None, coins=None, index=None):
+    """
+    Resolve a coin code or slug to a unique numeric coinmarketcap.com id.
+
+    Candidates match on normalized symbol or slug. Multiple candidates are
+    ordered by rank and then id (ascending) and the first one wins; when the
+    top two candidates tie on rank an :class:`AmbiguousCoinError` is raised
+    carrying the input, the normalized key, and the candidate list.
+
+    :param coin_code: coin code of a cryptocurrency e.g. btc
+    :param coin_name: coin name in case of many coins with same code e.g. sol -> solana, solcoin
+    :param coins: (optional) pre-fetched coin listing
+    :param index: (optional) pre-built index from :func:`build_coin_index`
+    :return: numeric coin id for the cryptocurrency on coinmarketcap.com
+    """
+
+    key = normalize(coin_code)
+    if index is None:
+        if coins is None:
+            coins = get_coin_list()
+        index = build_coin_index(coins)
+
+    candidates = []
+    seen_ids = set()
+    for coin in index.get(key, []):
+        coin_id = coin.get("id")
+        if coin_id not in seen_ids:
+            seen_ids.add(coin_id)
+            candidates.append(coin)
+
+    if coin_name is not None:
+        name_key = normalize(coin_name)
+        candidates = [c for c in candidates if normalize(c.get("name")) == name_key]
+
+    if not candidates:
+        raise InvalidCoinCode(
+            "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
+        )
+
+    candidates.sort(key=_coin_sort_key)
+    if len(candidates) > 1 and _coin_rank(candidates[0]) == _coin_rank(candidates[1]):
+        raise AmbiguousCoinError(coin_code, key, candidates)
+    return candidates[0]["id"]
+
+
+def get_coin_id(coin_code, coin_name):
+    """
+    This method fetches the id of currency from the given code
+    :param coin_code: coin code of a cryptocurrency e.g. btc
+    :param coin_name: coin name in case of many coins with same code e.g. sol -> solana, solcoin
+    :return: numeric coin id for the cryptocurrency on coinmarketcap.com
+    """
+
     try:
-        json_data = get_url_data(api_url).json()
-        error_code = json_data["status"]["error_code"]
-        if str(error_code) == "0":
-            coins = json_data["data"]["cryptoCurrencyList"]
-            matches = [
-                c
-                for c in coins
-                if c["symbol"].upper() == coin_code.upper()
-                and (coin_name is None or c["name"].lower() == coin_name.lower())
-            ]
-            if matches:
-                return matches[0]["id"]
-            raise InvalidCoinCode(
-                "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
-            )
-        if str(error_code) == "400":
-            raise InvalidCoinCode(
-                "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
-            )
-        raise Exception(json_data["status"]["error_message"])
+        return resolve_coin_id(coin_code, coin_name)
     except Exception as e:
         print("Error fetching coin id data for coin code {}".format(coin_code))
         print("Error message:", e)
@@ -102,7 +239,7 @@ def download_coin_data(
         end_date = datetime.date.today().strftime("%d-%m-%Y")
 
     coin_id = id_number if id_number else get_coin_id(coin_code, coin_name)
-    convert_id = _FIAT_IDS.get(fiat.upper())
+    convert_id = resolve_fiat_id(fiat)
     if convert_id is None:
         raise ValueError(f"Unknown fiat '{fiat}'. Supported: {_SUPPORTED_FIATS}.")
 
@@ -148,13 +285,17 @@ def download_coin_data(
 
         if id_number:
             show_coin_info = False
-            if coin_code and coin_code.upper() != result_json["data"]["symbol"].upper():
+            if coin_code and normalize(coin_code) != normalize(
+                result_json["data"]["symbol"]
+            ):
                 print(
                     f"INFO: Using 'id_number'! The 'coin_code' ({coin_code}) provided "
                     + "is different from the symbol returned."
                 )
                 show_coin_info = True
-            if coin_name and coin_name.lower() != result_json["data"]["name"].lower():
+            if coin_name and normalize(coin_name) != normalize(
+                result_json["data"]["name"]
+            ):
                 print(
                     f"INFO: Using 'id_number'! The 'coin_name' ({coin_name}) provided "
                     + "is different from the name returned."
@@ -197,3 +338,22 @@ class InvalidParameters(ValueError):
 
 class InvalidCoinCode(NotImplementedError):
     """This coin code is unavailable on 'coinmarketcap.com'"""
+
+
+class AmbiguousCoinError(ValueError):
+    """A coin identifier resolved to multiple equally-ranked coins."""
+
+    def __init__(self, input_value, normalized_key, candidates):
+        self.input_value = input_value
+        self.normalized_key = normalized_key
+        self.candidates = list(candidates)
+        summary = ", ".join(
+            "{}(id={}, rank={})".format(
+                c.get("name"), c.get("id"), c.get("cmcRank")
+            )
+            for c in self.candidates
+        )
+        super().__init__(
+            "Ambiguous coin identifier {!r} (normalized: {!r}); "
+            "candidates: {}".format(input_value, normalized_key, summary)
+        )
