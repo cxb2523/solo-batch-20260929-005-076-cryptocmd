@@ -15,7 +15,7 @@ import csv
 import tablib
 import warnings
 from datetime import datetime
-from .utils import download_coin_data, InvalidParameters
+from .utils import download_coin_data, normalize, InvalidParameters
 
 
 class CmcScraper(object):
@@ -103,12 +103,14 @@ class CmcScraper(object):
         if self.all_time:
             self.start_date, self.end_date = None, None
 
+        # Normalize lookup inputs through the shared pipeline (idempotent;
+        # utils re-normalizes internally) so both layers speak the same keys.
         coin_data = download_coin_data(
-            self.coin_code,
+            normalize(self.coin_code) if self.coin_code is not None else None,
             self.start_date,
             self.end_date,
-            self.fiat,
-            self.coin_name,
+            normalize(self.fiat) if self.fiat is not None else None,
+            normalize(self.coin_name) if self.coin_name is not None else None,
             self.id_number,
         )
 
